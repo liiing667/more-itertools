@@ -1,3 +1,6 @@
+import gc
+import platform
+
 from collections import Counter
 from decimal import Decimal
 from doctest import DocTestSuite
@@ -1756,3 +1759,258 @@ class RunningWindowSizeTests(TestCase):
                 self.assertRaises(ValueError),
             ):
                 list(function([1, 2, 3], maxlen=WindowSize()))
+
+
+class _StreamingSource:
+    """Helper for streaming-contract tests.
+
+    ``gen()`` returns a generator over *items* that records, on this
+    object, how many items were pulled from it and whether the generator
+    was closed (i.e. its ``finally`` block ran). The generator itself is
+    only referenced by the iterator under test, so dropping that iterator
+    lets the garbage collector propagate ``close()`` down to it.
+    """
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.pulled = 0
+        self.closed = False
+
+    def gen(self):
+        try:
+            for item in self.items:
+                self.pulled += 1
+                yield item
+        finally:
+            self.closed = True
+
+    def exploding_gen(self, at):
+        """Variant of :meth:`gen` that raises ``RuntimeError`` instead of
+        yielding the item equal to *at*."""
+        try:
+            for item in self.items:
+                if item == at:
+                    raise RuntimeError('boom')
+                self.pulled += 1
+                yield item
+        finally:
+            self.closed = True
+
+
+class GroupingLazinessTests(TestCase):
+    """The grouping recipes must not run the source iterator to
+    completion before (or while) producing their first output item."""
+
+    def test_grouper_pulls_one_group_at_a_time(self):
+        for incomplete in ('fill', 'ignore', 'strict'):
+            with self.subTest(incomplete=incomplete):
+                source = _StreamingSource(range(100))
+                iterator = mi.grouper(source.gen(), 3, incomplete=incomplete)
+                self.assertEqual(source.pulled, 0)
+                next(iterator)
+                self.assertEqual(source.pulled, 3)
+
+    def test_batched_pulls_one_batch_at_a_time(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.batched(source.gen(), 3)
+        self.assertEqual(source.pulled, 0)
+        self.assertEqual(next(iterator), (0, 1, 2))
+        self.assertEqual(source.pulled, 3)
+
+    def test_roundrobin_pulls_one_item_per_source(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.roundrobin(source.gen(), 'ab')
+        self.assertEqual(next(iterator), 0)
+        self.assertEqual(source.pulled, 1)
+
+    def test_sliding_window_pulls_one_window_at_a_time(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.sliding_window(source.gen(), 3)
+        self.assertEqual(next(iterator), (0, 1, 2))
+        self.assertEqual(source.pulled, 3)
+
+    def test_take_pulls_exactly_n_items(self):
+        source = _StreamingSource(range(100))
+        self.assertEqual(mi.take(3, source.gen()), [0, 1, 2])
+        self.assertEqual(source.pulled, 3)
+
+    def test_take_zero_pulls_nothing(self):
+        source = _StreamingSource(range(100))
+        self.assertEqual(mi.take(0, source.gen()), [])
+        self.assertEqual(source.pulled, 0)
+
+    def test_consume_pulls_exactly_n_items(self):
+        source = _StreamingSource(range(100))
+        mi.consume(source.gen(), 3)
+        self.assertEqual(source.pulled, 3)
+
+
+class GroupingEarlyTerminationTests(TestCase):
+    """When the caller stops consuming a grouping iterator early (e.g.
+    ``break``) and drops it, the underlying source generator must receive
+    ``close()`` so that resources such as file handles are released.
+
+    The docstrings do not spell this out for every recipe; these tests
+    pin the behavior the streaming pipeline relies on. They rely on
+    CPython reference counting and fall back to ``gc.collect()`` on other
+    implementations.
+    """
+
+    def assertClosesSource(self, make_iterator):
+        source = _StreamingSource(range(10))
+        iterator = make_iterator(source.gen())
+        item = next(iterator)
+        del item, iterator
+        platform.python_implementation() == 'CPython' or gc.collect()
+        self.assertTrue(source.closed)
+
+    def test_grouper_fill(self):
+        self.assertClosesSource(lambda s: mi.grouper(s, 3))
+
+    def test_grouper_ignore(self):
+        self.assertClosesSource(
+            lambda s: mi.grouper(s, 3, incomplete='ignore')
+        )
+
+    def test_grouper_strict(self):
+        self.assertClosesSource(
+            lambda s: mi.grouper(s, 3, incomplete='strict')
+        )
+
+    def test_batched(self):
+        self.assertClosesSource(lambda s: mi.batched(s, 3))
+
+    def test_roundrobin(self):
+        self.assertClosesSource(lambda s: mi.roundrobin(s, 'ab'))
+
+    def test_partition_child(self):
+        self.assertClosesSource(
+            lambda s: mi.partition(lambda x: x % 2, s)[0]
+        )
+
+    def test_sliding_window(self):
+        self.assertClosesSource(lambda s: mi.sliding_window(s, 3))
+
+    def test_pad_none(self):
+        self.assertClosesSource(lambda s: mi.pad_none(s))
+
+    def test_consume_to_completion_closes_source(self):
+        # Exhausting the source through consume() runs its finally block.
+        source = _StreamingSource(range(5))
+        mi.consume(source.gen())
+        self.assertTrue(source.closed)
+
+
+class GroupingEmptyInputTests(TestCase):
+    """Empty-input behavior of the grouping recipes, as documented."""
+
+    def test_grouper(self):
+        for incomplete in ('fill', 'ignore', 'strict'):
+            with self.subTest(incomplete=incomplete):
+                actual = mi.grouper([], 3, incomplete=incomplete)
+                self.assertEqual(list(actual), [])
+
+    def test_batched(self):
+        self.assertEqual(list(mi.batched([], 3)), [])
+        self.assertEqual(list(mi.batched([], 3, strict=True)), [])
+
+    def test_roundrobin(self):
+        self.assertEqual(list(mi.roundrobin([], [])), [])
+
+    def test_partition(self):
+        false_items, true_items = mi.partition(bool, [])
+        self.assertEqual(list(false_items), [])
+        self.assertEqual(list(true_items), [])
+
+    def test_sliding_window(self):
+        self.assertEqual(list(mi.sliding_window([], 3)), [])
+
+    def test_transpose(self):
+        # Documented: "If the input is empty, no output will be produced."
+        self.assertEqual(list(mi.transpose([])), [])
+
+
+class GroupingShortFinalChunkTests(TestCase):
+    """Behavior when the source length is not a multiple of the group
+    size, as documented in each recipe's docstring."""
+
+    def test_grouper_fill_pads_the_last_group(self):
+        # Documented: "the last group will contain instances of
+        # *fillvalue*"
+        actual = mi.grouper('ABCDEFG', 3, incomplete='fill', fillvalue='x')
+        self.assertEqual(
+            list(actual), [('A', 'B', 'C'), ('D', 'E', 'F'), ('G', 'x', 'x')]
+        )
+
+    def test_grouper_ignore_drops_the_last_group(self):
+        # Documented: "the last group will not be emitted"
+        actual = mi.grouper('ABCDEFG', 3, incomplete='ignore')
+        self.assertEqual(list(actual), [('A', 'B', 'C'), ('D', 'E', 'F')])
+
+    def test_grouper_strict_raises_after_the_full_groups(self):
+        # Documented: "a ValueError will be raised"; the complete groups
+        # are still yielded first.
+        iterator = mi.grouper('ABCDEFG', 3, incomplete='strict')
+        self.assertEqual(next(iterator), ('A', 'B', 'C'))
+        self.assertEqual(next(iterator), ('D', 'E', 'F'))
+        self.assertRaises(ValueError, next, iterator)
+
+    def test_batched_short_final_batch(self):
+        actual = mi.batched(range(8), 3)
+        self.assertEqual(list(actual), [(0, 1, 2), (3, 4, 5), (6, 7)])
+
+    def test_batched_strict_raises_after_the_full_batches(self):
+        iterator = mi.batched(range(8), 3, strict=True)
+        self.assertEqual(next(iterator), (0, 1, 2))
+        self.assertEqual(next(iterator), (3, 4, 5))
+        self.assertRaises(ValueError, next, iterator)
+
+    def test_sliding_window_wider_than_input(self):
+        # Documented: "If *iterable* has fewer than *n* items, then
+        # nothing is yielded"
+        self.assertEqual(list(mi.sliding_window([1, 2], 3)), [])
+
+    def test_take_more_than_available(self):
+        # Documented: "If there are fewer than *n* items in the
+        # iterable, all of them are returned."
+        self.assertEqual(mi.take(10, iter([1, 2, 3])), [1, 2, 3])
+
+
+class GroupingExceptionTests(TestCase):
+    """An exception raised by the source iterator mid-stream must
+    propagate unchanged through the grouping recipes (not be swallowed
+    or replaced), and the source's ``finally`` blocks must run.
+    """
+
+    def assertPropagates(self, make_iterator):
+        source = _StreamingSource(range(10))
+        iterator = make_iterator(source.exploding_gen(4))
+        with self.assertRaises(RuntimeError):
+            while True:
+                next(iterator)
+        # The source generator's finally block runs as the exception
+        # passes through it.
+        self.assertTrue(source.closed)
+
+    def test_grouper(self):
+        self.assertPropagates(lambda s: mi.grouper(s, 3))
+
+    def test_batched(self):
+        self.assertPropagates(lambda s: mi.batched(s, 3))
+
+    def test_roundrobin(self):
+        self.assertPropagates(lambda s: mi.roundrobin(s, 'abcdef'))
+
+    def test_partition(self):
+        self.assertPropagates(
+            lambda s: (list(t) for t in mi.partition(lambda x: x % 2, s))
+        )
+
+    def test_sliding_window(self):
+        self.assertPropagates(lambda s: mi.sliding_window(s, 3))
+
+    def test_transpose_ragged_rows_raise(self):
+        # Documented: "The caller should ensure that the dimensions of
+        # the input are compatible"; ragged rows raise ValueError.
+        with self.assertRaises(ValueError):
+            list(mi.transpose([(1, 2, 3), (4, 5)]))

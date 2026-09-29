@@ -7414,3 +7414,393 @@ class TestRandomOrderedRange(TestCase):
         # Without mitigation the LCG doesn't produce many distinct permutations
         perms = set(tuple(mi.random_ordered_range(6)) for _ in range(10**5))
         self.assertEqual(len(perms), factorial(6))
+
+
+class _StreamingSource:
+    """Helper for streaming-contract tests.
+
+    ``gen()`` returns a generator over *items* that records, on this
+    object, how many items were pulled from it and whether the generator
+    was closed (i.e. its ``finally`` block ran). The generator itself is
+    only referenced by the iterator under test, so dropping that iterator
+    lets the garbage collector propagate ``close()`` down to it.
+    """
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.pulled = 0
+        self.closed = False
+
+    def gen(self):
+        try:
+            for item in self.items:
+                self.pulled += 1
+                yield item
+        finally:
+            self.closed = True
+
+    def exploding_gen(self, at):
+        """Variant of :meth:`gen` that raises ``RuntimeError`` instead of
+        yielding the item equal to *at*."""
+        try:
+            for item in self.items:
+                if item == at:
+                    raise RuntimeError('boom')
+                self.pulled += 1
+                yield item
+        finally:
+            self.closed = True
+
+
+class GroupingLazinessTests(TestCase):
+    """The grouping functions must not run the source iterator to
+    completion before (or while) producing their first output item; only
+    the items needed for that first output may be pulled. This is what
+    makes them usable on multi-million-line streams.
+    """
+
+    def test_chunked_pulls_one_chunk_at_a_time(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.chunked(source.gen(), 3)
+        self.assertEqual(source.pulled, 0)  # nothing pulled up front
+        self.assertEqual(next(iterator), [0, 1, 2])
+        self.assertEqual(source.pulled, 3)
+
+    def test_ichunked_in_order_does_not_read_ahead(self):
+        # Documented: "If the sub-iterables are read in order, the
+        # elements of *iterable* won't be stored in memory."
+        source = _StreamingSource(range(100))
+        chunks = mi.ichunked(source.gen(), 3)
+        first_chunk = next(chunks)
+        self.assertEqual(next(first_chunk), 0)
+        self.assertEqual(source.pulled, 1)
+        self.assertEqual(list(first_chunk), [1, 2])
+        self.assertEqual(source.pulled, 3)
+
+    def test_split_into_pulls_only_the_current_size(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.split_into(source.gen(), [4, 5])
+        self.assertEqual(next(iterator), [0, 1, 2, 3])
+        self.assertEqual(source.pulled, 4)
+
+    def test_distribute_does_not_pull_source_into_memory(self):
+        # Documented on divide(): "see :func:`distribute`, which does not
+        # first pull the iterable into memory."
+        source = _StreamingSource(range(100))
+        children = mi.distribute(3, source.gen())
+        self.assertEqual(source.pulled, 0)
+        self.assertEqual(next(children[0]), 0)
+        self.assertEqual(source.pulled, 1)
+
+    def test_divide_is_documented_to_exhaust_the_source(self):
+        # Pin the documented exception to the laziness rule:
+        # "This function will exhaust the iterable before returning."
+        source = _StreamingSource(range(6))
+        children = mi.divide(3, source.gen())
+        self.assertEqual(source.pulled, 6)
+        self.assertEqual(
+            [list(child) for child in children], [[0, 1], [2, 3], [4, 5]]
+        )
+
+    def test_windowed_pulls_one_window_at_a_time(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.windowed(source.gen(), 3)
+        self.assertEqual(next(iterator), (0, 1, 2))
+        self.assertEqual(source.pulled, 3)
+
+    def test_interleave_pulls_one_item_per_source(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.interleave(source.gen(), 'abc')
+        self.assertEqual(next(iterator), 0)
+        self.assertEqual(source.pulled, 1)
+
+    def test_interleave_longest_pulls_one_item_per_source(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.interleave_longest(source.gen(), 'ab')
+        self.assertEqual(next(iterator), 0)
+        self.assertEqual(source.pulled, 1)
+
+    def test_stagger_does_not_run_ahead_of_the_first_tuple(self):
+        source = _StreamingSource(range(100))
+        iterator = mi.stagger(source.gen())
+        self.assertEqual(next(iterator), (None, 0, 1))
+        self.assertEqual(source.pulled, 2)
+
+    def test_consecutive_groups_reads_only_past_the_first_run(self):
+        source = _StreamingSource([1, 2, 3, 10, 11, 12, 20])
+        groups = mi.consecutive_groups(source.gen())
+        self.assertEqual(list(next(groups)), [1, 2, 3])
+        # groupby must read one item past the end of the run, no more
+        self.assertEqual(source.pulled, 4)
+
+    def test_spy_pulls_only_n_items(self):
+        source = _StreamingSource(range(100))
+        head, iterator = mi.spy(source.gen(), 2)
+        self.assertEqual(head, [0, 1])
+        self.assertEqual(source.pulled, 2)
+        self.assertEqual(next(iterator), 0)
+
+    def test_bucket_does_not_consume_on_creation(self):
+        # Documented on map_reduce(): ":func:`map_reduce` consumes the
+        # iterable immediately and returns a dictionary, while
+        # :func:`bucket` does not."
+        source = _StreamingSource(range(10))
+        mi.bucket(source.gen(), key=lambda x: x % 2)
+        self.assertEqual(source.pulled, 0)
+
+    def test_map_reduce_is_documented_to_consume_immediately(self):
+        # Pin the documented eager counterpart of bucket().
+        source = _StreamingSource(range(10))
+        result = mi.map_reduce(source.gen(), keyfunc=lambda x: x % 2)
+        self.assertEqual(source.pulled, 10)
+        self.assertEqual(list(result[0]), [0, 2, 4, 6, 8])
+
+
+class GroupingEarlyTerminationTests(TestCase):
+    """When the caller stops consuming a grouping iterator early (e.g.
+    ``break``) and drops it, the underlying source generator must receive
+    ``close()`` so that resources such as file handles are released.
+
+    The docstrings do not spell this out for every function; these tests
+    pin the behavior the streaming pipeline relies on. Like the existing
+    islice_extended tests, they rely on CPython reference counting and
+    fall back to ``gc.collect()`` on other implementations.
+    """
+
+    def assertClosesSource(self, make_iterator):
+        source = _StreamingSource(range(10))
+        iterator = make_iterator(source.gen())
+        item = next(iterator)
+        del item, iterator
+        platform.python_implementation() == 'CPython' or gc.collect()
+        self.assertTrue(source.closed)
+
+    def test_chunked(self):
+        self.assertClosesSource(lambda s: mi.chunked(s, 3))
+
+    def test_ichunked(self):
+        self.assertClosesSource(lambda s: mi.ichunked(s, 3))
+
+    def test_split_into(self):
+        self.assertClosesSource(lambda s: mi.split_into(s, [3, 3]))
+
+    def test_windowed(self):
+        self.assertClosesSource(lambda s: mi.windowed(s, 3))
+
+    def test_consecutive_groups(self):
+        self.assertClosesSource(lambda s: mi.consecutive_groups(s))
+
+    def test_split_at(self):
+        self.assertClosesSource(lambda s: mi.split_at(s, lambda x: x % 3 == 0))
+
+    def test_split_before(self):
+        self.assertClosesSource(
+            lambda s: mi.split_before(s, lambda x: x % 3 == 0)
+        )
+
+    def test_split_after(self):
+        self.assertClosesSource(
+            lambda s: mi.split_after(s, lambda x: x % 3 == 0)
+        )
+
+    def test_split_when(self):
+        self.assertClosesSource(
+            lambda s: mi.split_when(s, lambda a, b: b - a > 1)
+        )
+
+    def test_interleave(self):
+        self.assertClosesSource(lambda s: mi.interleave(s, 'abcde'))
+
+    def test_interleave_longest(self):
+        self.assertClosesSource(lambda s: mi.interleave_longest(s, 'ab'))
+
+    def test_stagger(self):
+        self.assertClosesSource(lambda s: mi.stagger(s))
+
+    def test_distribute_child(self):
+        self.assertClosesSource(lambda s: iter(mi.distribute(2, s)[0]))
+
+    def test_bucket_child(self):
+        self.assertClosesSource(
+            lambda s: mi.bucket(s, key=lambda x: x % 2)[0]
+        )
+
+    def test_padded(self):
+        self.assertClosesSource(lambda s: mi.padded(s, n=5))
+
+    def test_mark_ends(self):
+        self.assertClosesSource(lambda s: mi.mark_ends(s))
+
+    def test_spy_iterator(self):
+        self.assertClosesSource(lambda s: mi.spy(s, 2)[1])
+
+    def test_peekable(self):
+        self.assertClosesSource(lambda s: iter(mi.peekable(s)))
+
+    def test_seekable(self):
+        self.assertClosesSource(lambda s: mi.seekable(s))
+
+
+class GroupingEmptyInputTests(TestCase):
+    """Empty-input behavior of the grouping functions, as documented."""
+
+    def test_chunked(self):
+        self.assertEqual(list(mi.chunked([], 3)), [])
+        self.assertEqual(list(mi.chunked([], 3, strict=True)), [])
+
+    def test_ichunked(self):
+        self.assertEqual([list(c) for c in mi.ichunked([], 3)], [])
+
+    def test_sliced(self):
+        self.assertEqual(list(mi.sliced([], 3)), [])
+        self.assertEqual(list(mi.sliced([], 3, strict=True)), [])
+
+    def test_split_into(self):
+        # Documented: "fewer items will be returned in the iteration
+        # that overruns the *iterable* and further lists will be empty"
+        self.assertEqual(list(mi.split_into([], [1, 2])), [[], []])
+
+    def test_distribute(self):
+        # Documented: "the last returned iterables will be empty"
+        children = mi.distribute(3, [])
+        self.assertEqual([list(c) for c in children], [[], [], []])
+
+    def test_divide(self):
+        # Documented: "the last returned iterables will be empty"
+        children = mi.divide(3, [])
+        self.assertEqual([list(c) for c in children], [[], [], []])
+
+    def test_windowed(self):
+        self.assertEqual(list(mi.windowed([], 3)), [])
+
+    def test_consecutive_groups(self):
+        self.assertEqual(list(mi.consecutive_groups([])), [])
+
+    def test_interleave(self):
+        self.assertEqual(list(mi.interleave([], [])), [])
+        self.assertEqual(list(mi.interleave_longest([], [])), [])
+
+    def test_stagger(self):
+        self.assertEqual(list(mi.stagger([])), [])
+
+    def test_padded(self):
+        # Documented: "at least *n* items are emitted"
+        self.assertEqual(list(mi.padded([], n=3)), [None, None, None])
+
+    def test_split_before_after_when(self):
+        # Documented in docs/versions.rst: these "no longer yield an
+        # empty list for an empty *iterable*"
+        self.assertEqual(list(mi.split_before([], bool)), [])
+        self.assertEqual(list(mi.split_after([], bool)), [])
+        self.assertEqual(list(mi.split_when([], lambda a, b: True)), [])
+
+    def test_split_at(self):
+        # The final group is always yielded, even when it is empty;
+        # consistent with the docstring's trailing-empty-group example.
+        self.assertEqual(list(mi.split_at([], bool)), [[]])
+
+
+class GroupingShortFinalChunkTests(TestCase):
+    """Behavior when the source length is not a multiple of the group
+    size, as documented in each function's docstring."""
+
+    def test_chunked_short_final_chunk(self):
+        # Documented: "the last yielded list will have fewer than *n*
+        # elements"
+        self.assertEqual(
+            list(mi.chunked(range(8), 3)), [[0, 1, 2], [3, 4, 5], [6, 7]]
+        )
+
+    def test_chunked_strict_raises_before_the_last_chunk(self):
+        # Documented: "ValueError will be raised before the last list is
+        # yielded", i.e. after all full chunks have been yielded.
+        iterator = mi.chunked(range(8), 3, strict=True)
+        self.assertEqual(next(iterator), [0, 1, 2])
+        self.assertEqual(next(iterator), [3, 4, 5])
+        self.assertRaises(ValueError, next, iterator)
+
+    def test_ichunked_short_final_chunk(self):
+        actual = [list(c) for c in mi.ichunked(range(8), 3)]
+        self.assertEqual(actual, [[0, 1, 2], [3, 4, 5], [6, 7]])
+
+    def test_sliced_strict_raises_before_the_last_slice(self):
+        iterator = mi.sliced(list(range(8)), 3, strict=True)
+        self.assertEqual(next(iterator), [0, 1, 2])
+        self.assertEqual(next(iterator), [3, 4, 5])
+        self.assertRaises(ValueError, next, iterator)
+
+    def test_split_into_overrun(self):
+        # Documented: "fewer items will be returned in the iteration
+        # that overruns the *iterable* and further lists will be empty"
+        actual = mi.split_into([1, 2, 3, 4], [1, 2, 3, 4])
+        self.assertEqual(list(actual), [[1], [2, 3], [4], []])
+
+    def test_distribute_uneven(self):
+        # Documented: "the length of the returned iterables will not be
+        # identical"
+        children = mi.distribute(3, range(7))
+        self.assertEqual(
+            [list(c) for c in children], [[0, 3, 6], [1, 4], [2, 5]]
+        )
+
+    def test_divide_uneven(self):
+        # Documented: "the length of the returned iterables will not be
+        # identical"
+        children = mi.divide(3, range(7))
+        self.assertEqual(
+            [list(c) for c in children], [[0, 1, 2], [3, 4], [5, 6]]
+        )
+
+    def test_windowed_fillvalue_for_short_window(self):
+        # Documented: "When the window is larger than the iterable,
+        # *fillvalue* is used in place of missing values"
+        self.assertEqual(list(mi.windowed([1, 2, 3], 4)), [(1, 2, 3, None)])
+
+
+class GroupingExceptionTests(TestCase):
+    """An exception raised by the source iterator mid-stream must
+    propagate unchanged through the grouping functions (not be swallowed
+    or replaced), and the source's ``finally`` blocks must run.
+    """
+
+    def assertPropagates(self, make_iterator):
+        source = _StreamingSource(range(10))
+        iterator = make_iterator(source.exploding_gen(4))
+        with self.assertRaises(RuntimeError):
+            while True:
+                next(iterator)
+        # The source generator's finally block runs as the exception
+        # passes through it.
+        self.assertTrue(source.closed)
+
+    def test_chunked(self):
+        self.assertPropagates(lambda s: mi.chunked(s, 3))
+
+    def test_chunked_strict(self):
+        # A source error is not masked by the strict-mode ValueError.
+        self.assertPropagates(lambda s: mi.chunked(s, 3, strict=True))
+
+    def test_ichunked(self):
+        self.assertPropagates(
+            lambda s: (list(c) for c in mi.ichunked(s, 3))
+        )
+
+    def test_split_into(self):
+        self.assertPropagates(lambda s: mi.split_into(s, [3, 3, 3, 3]))
+
+    def test_windowed(self):
+        self.assertPropagates(lambda s: mi.windowed(s, 3))
+
+    def test_consecutive_groups(self):
+        self.assertPropagates(
+            lambda s: (list(g) for g in mi.consecutive_groups(s))
+        )
+
+    def test_split_at(self):
+        self.assertPropagates(lambda s: mi.split_at(s, lambda x: x % 2 == 0))
+
+    def test_interleave(self):
+        self.assertPropagates(lambda s: mi.interleave(s, 'abcdefghij'))
+
+    def test_stagger(self):
+        self.assertPropagates(lambda s: mi.stagger(s))
